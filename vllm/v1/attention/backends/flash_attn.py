@@ -88,6 +88,106 @@ from vllm.v1.worker.cp_utils import (
 
 logger = init_logger(__name__)
 
+# [llamacpp-lessons:fa4_wave_splits] wave-quantization-aware split-KV choice
+# for FA4 (llama.cpp ggml-cuda/fattn-common.cuh parallel_blocks search).
+import os as _llcpp_os  # noqa: E402
+
+
+def _llcpp_env_int(name: str, default: int) -> int:
+    try:
+        return int(_llcpp_os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+_LLCPP_WAVE_MAX_SPLITS = min(_llcpp_env_int("VLLM_FA4_WAVE_SPLITS", 0), 256)
+_LLCPP_WAVE_HEADS = frozenset(
+    int(_h)
+    for _h in _llcpp_os.environ.get("VLLM_FA4_WAVE_SPLITS_HEADS", "512").split(",")
+    if _h.strip().isdigit()
+)
+_LLCPP_WAVE_MIN_KV = max(_llcpp_env_int("VLLM_FA4_WAVE_MIN_KV_PER_SPLIT", 2048), 1)
+_LLCPP_WAVE_TILE_M = max(_llcpp_env_int("VLLM_FA4_WAVE_TILE_M", 64), 1)
+_LLCPP_WAVE_TILE_N = max(_llcpp_env_int("VLLM_FA4_WAVE_TILE_N", 64), 1)
+_LLCPP_WAVE_CTAS_PER_SM = max(_llcpp_env_int("VLLM_FA4_WAVE_CTAS_PER_SM", 1), 1)
+# fixed per-CTA cost of a split (Q load + fp32 partial O store), in n-blocks
+_LLCPP_WAVE_SPLIT_COST = max(_llcpp_env_int("VLLM_FA4_WAVE_SPLIT_COST", 2), 0)
+_LLCPP_WAVE_PARTIAL_BYTES = max(_llcpp_env_int("VLLM_FA4_WAVE_PARTIAL_MB", 512), 1) << 20
+_LLCPP_WAVE_OVERRIDE_CG = _llcpp_os.environ.get("VLLM_FA4_WAVE_OVERRIDE_CG", "1") == "1"
+_LLCPP_WAVE_LOG = _llcpp_os.environ.get("VLLM_FA4_WAVE_SPLITS_LOG", "0") == "1"
+_llcpp_wave_cache: dict[tuple, int] = {}
+_llcpp_wave_num_sms: list[int] = []
+
+
+def _llcpp_wave_num_splits(
+    num_seqs: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    qhead_per_kvhead: int,
+    num_kv_heads: int,
+    num_tokens: int,
+    num_heads: int,
+    head_dim_v: int,
+    current: int,
+) -> int:
+    """Return the split count to pass to FA4 (``current`` = unchanged)."""
+    tile_n = _LLCPP_WAVE_TILE_N
+    n_blocks = (max_seqlen_k + tile_n - 1) // tile_n
+    key = (num_seqs, max_seqlen_q, n_blocks, qhead_per_kvhead, num_kv_heads,
+           num_tokens, num_heads, head_dim_v, current)
+    hit = _llcpp_wave_cache.get(key)
+    if hit is not None:
+        return hit
+    if not _llcpp_wave_num_sms:
+        _llcpp_wave_num_sms.append(
+            torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+        )
+    num_sms = _llcpp_wave_num_sms[0]
+    per_wave = num_sms * _LLCPP_WAVE_CTAS_PER_SM
+    m_blocks = (max_seqlen_q * qhead_per_kvhead + _LLCPP_WAVE_TILE_M - 1) // (
+        _LLCPP_WAVE_TILE_M
+    )
+    tiles = num_seqs * num_kv_heads * m_blocks
+    result = current
+    if tiles > 0 and n_blocks > 4:
+        partial_bytes_per_split = max(num_tokens * num_heads * (head_dim_v + 1) * 4, 1)
+        max_p = min(
+            _LLCPP_WAVE_MAX_SPLITS,
+            max(1, max_seqlen_k // _LLCPP_WAVE_MIN_KV),
+            n_blocks,
+            max(1, _LLCPP_WAVE_PARTIAL_BYTES // partial_bytes_per_split),
+        )
+
+        def cost(p: int) -> int:
+            waves = (tiles * p + per_wave - 1) // per_wave
+            per_cta = (n_blocks + p - 1) // p + (_LLCPP_WAVE_SPLIT_COST if p > 1 else 0)
+            return waves * per_cta
+
+        # FA4's own choice (num_splits_heuristic; 0 means "no split").
+        fa4_p = current if current > 0 else min(num_sms // tiles, 128, n_blocks)
+        fa4_p = max(fa4_p, 1)
+        costs = {p: cost(p) for p in range(1, max_p + 1)}
+        min_cost = min(costs.values())
+        # smallest p within 3% of the optimum: the cost model ignores the
+        # combine kernel, whose traffic grows linearly with p.
+        best_p = min(p for p, c in costs.items() if c * 100 <= min_cost * 103)
+        best_cost = costs[best_p]
+        if best_p != fa4_p and best_cost * 100 < cost(fa4_p) * 95:
+            result = best_p
+        if _LLCPP_WAVE_LOG:
+            logger.info(
+                "[fa4_wave_splits] seqs=%d q=%d k=%d tiles=%d n_blocks=%d "
+                "fa4_p=%d (cost %d) best_p=%d (cost %d) -> num_splits=%d",
+                num_seqs, max_seqlen_q, max_seqlen_k, tiles, n_blocks,
+                fa4_p, cost(fa4_p), best_p, best_cost, result,
+            )
+    if len(_llcpp_wave_cache) > 65536:
+        _llcpp_wave_cache.clear()
+    _llcpp_wave_cache[key] = result
+    return result
+
 FA4_DENSE_FLOAT_DTYPES = (torch.bfloat16, torch.float16)
 FA4_DENSE_Q_TILE = 128
 FA4_DENSE_NUM_BLOCKS = 256
@@ -314,6 +414,9 @@ class FlashAttentionBackend(AttentionBackend):
                 return None
             head_size = kv_cache_spec.head_size
             uses_fp8_kv = kv_cache_spec.kv_quant_mode == KVQuantMode.FP8_PER_TENSOR
+            # PATCH(konly-bs): K-only global specs run on attn512 (any page size)
+            if head_size == 512 and getattr(kv_cache_spec, "head_size_v", None) in (0, 128):
+                return None
 
         if (
             current_platform.is_device_capability_family(90)
@@ -706,7 +809,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         self.max_num_splits = 0  # No upper bound on the number of splits.
         self.aot_schedule = get_flash_attn_version() == 3
+        # PATCH(konly): head_size_v 0 = K-only cache (routed to attn512, not FA)
         head_size_v = getattr(kv_cache_spec, "head_size_v", None)
+        if head_size_v in (0, 128) and kv_cache_spec.head_size == 512:
+            head_size_v = None
         fa_version = get_flash_attn_version(
             head_size=self.headdim,
             head_size_v=head_size_v,
@@ -721,6 +827,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             vllm_config.kernel_config.enable_jit_warmup
             and self.model_config.hf_config.model_type in ("gemma4", "gemma4_unified")
             and fa_version == 4
+            and kv_cache_spec.head_size_v == kv_cache_spec.head_size  # PATCH(konly)
         ):
             _FA4_DENSE_ATTENTION_KERNEL.register_warmup(
                 vllm_config=vllm_config,
@@ -1253,6 +1360,9 @@ class FlashAttentionImpl(AttentionImpl):
                 layer,
             )
 
+        if getattr(layer, "konly", False):  # PATCH(konly)
+            return _konly_forward(self, layer, query, kv_cache, attn_metadata, output)
+
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         # Fix degenerate strides on size-1 dims (e.g. num_kv_heads=1 with TP).
@@ -1401,6 +1511,31 @@ class FlashAttentionImpl(AttentionImpl):
                 block_table = block_table[:, :num_pages]
                 num_splits = 1
 
+            if (
+                _LLCPP_WAVE_MAX_SPLITS > 1  # [llamacpp-lessons:fa4_wave_splits]
+                and self.vllm_flash_attn_version == 4
+                and not self.fa4_hd256
+                and self.head_size in _LLCPP_WAVE_HEADS
+                and (sliding_window_size is None or sliding_window_size[0] < 0)
+                and dynamic_causal is None
+                and rswa_mask_mod_fn is None
+                and mm_mask_mod is None
+                and self.sinks is None
+                and (num_splits == 0 or (num_splits > 1 and _LLCPP_WAVE_OVERRIDE_CG))
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                num_splits = _llcpp_wave_num_splits(
+                    cu_seqlens_q.shape[0] - 1,
+                    int(max_seqlen_q),
+                    int(max_seqlen_k),
+                    self.num_heads // self.num_kv_heads,
+                    self.num_kv_heads,
+                    int(num_actual_tokens),
+                    self.num_heads,
+                    self.head_size,
+                    num_splits,
+                )
+
             _FA4_DENSE_ATTENTION_KERNEL(
                 q=query[:num_actual_tokens],
                 k=key_cache,
@@ -1440,6 +1575,23 @@ class FlashAttentionImpl(AttentionImpl):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
+            return
+
+        _ko = getattr(layer, "konly", 0)
+        if _ko:  # PATCH(konly)
+            rows = kv_cache.transpose(1, 2)  # (B, N, H, D) or (B, N, H, D + 128)
+            vc = rows[..., : self.head_size] if _ko == 2 else rows
+            reshape_and_cache_flash(value, value, vc, vc, slot_mapping, self.kv_cache_dtype,
+                                    layer._v_scale, layer._v_scale)
+            if _ko == 2:  # sidecar: RoPE'd K dims [0,64) and [D/2, D/2+64)
+                h = self.head_size // 2
+                reshape_and_cache_flash(
+                    key[..., :64].contiguous(), key[..., h : h + 64].contiguous(),
+                    rows[..., self.head_size : self.head_size + 64],
+                    rows[..., self.head_size + 64 : self.head_size + 128],
+                    # v_scale: the kernel dequantises every K chunk (b and sidecar) with one
+                    # k_descale = layer._v_scale
+                    slot_mapping, self.kv_cache_dtype, layer._v_scale, layer._v_scale)
             return
 
         # Scatter write into the KV cache using slot_mapping indices.
@@ -1877,3 +2029,64 @@ def _make_rswa_mask_mod():
 
 
 _FA4_DENSE_ATTENTION_KERNEL = FA4DenseAttentionKernel()
+
+
+# PATCH(konly) ---------------------------------------------------------------
+import os as _konly_os
+
+_KONLY_MOD = None
+_KONLY_WARMED = False  # PATCH(konly-warm)
+_KONLY_GRAPH_KV = int(_konly_os.environ.get("VLLM_KONLY_GRAPH_KV", "65536"))
+
+
+def _konly_kernel():
+    global _KONLY_MOD
+    if _KONLY_MOD is None:
+        import importlib.util
+        import sys
+
+        name = "attn512_kernel"
+        if name in sys.modules:
+            _KONLY_MOD = sys.modules[name]
+        else:
+            path = _konly_os.path.join(
+                _konly_os.environ.get("ATTN512_PATH", "/workspace/attn512"), "kernel.py"
+            )
+            spec = importlib.util.spec_from_file_location(name, path)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[name] = mod
+            spec.loader.exec_module(mod)
+            _KONLY_MOD = mod
+    return _KONLY_MOD
+
+
+def _konly_forward(impl, layer, query, kv_cache, md, output):
+    """K-only global layer: kv_cache [blocks, Hkv, page, D] holds V (= b); the attn512 Gluon
+    kernel rebuilds K = rope(k_norm.weight * b) per tile.  Also used under full CUDA graphs:
+    the split count is then chosen for VLLM_KONLY_GRAPH_KV keys (extra splits are empty)."""
+    n = md.num_actual_tokens
+    vc = kv_cache.transpose(1, 2)
+    if is_quantized_kv_cache(impl.kv_cache_dtype):
+        vc = vc.view(current_platform.fp8_dtype())
+    k_norm, rope = layer._konly_ref
+    sidecar = layer.konly == 2
+    if sidecar:
+        vc = vc[..., : impl.head_size]  # rows keep their D + 128 stride; the kernel reads the sidecar
+    max_k = int(md.max_seq_len)
+    if torch.cuda.is_current_stream_capturing():
+        max_k = max(max_k, _KONLY_GRAPH_KV)
+    else:
+        global _KONLY_WARMED
+        if not _KONLY_WARMED and hasattr(_konly_kernel(), "warmup_konly"):  # PATCH(konly-warm)
+            _KONLY_WARMED = True
+            _konly_kernel().warmup_konly(
+                query[:n], vc, md.block_table, impl.scale, layer._v_scale, k_norm.weight,
+                None if sidecar else rope.cos_sin_cache)
+    vds = layer._v_scale
+    _konly_kernel().attn512_paged(
+        query[:n], vc, vc, md.block_table, md.query_start_loc, md.seq_lens,
+        int(md.max_query_len), max_k, impl.scale,
+        k_descale=vds, v_descale=vds, out=output[:n],
+        k_norm_weight=k_norm.weight, cos_sin_cache=None if sidecar else rope.cos_sin_cache,
+    )
+    return output

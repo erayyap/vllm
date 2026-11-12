@@ -162,6 +162,10 @@ class Gemma4Speculator(TargetDependentARSpeculator):
                 target_layer_name
             ]
             _copy_target_kv_scales(attn, target_attn)
+            if getattr(target_attn, "konly", False):  # PATCH(konly): shared K-only cache
+                attn.konly = target_attn.konly
+                attn._konly_ref = target_attn._konly_ref
+                attn.query_quant = None
 
             logger.info(
                 "Gemma4 MTP: draft layer %d (%s) -> %s",

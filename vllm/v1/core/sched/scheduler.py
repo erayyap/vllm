@@ -732,6 +732,38 @@ class Scheduler(SchedulerInterface):
         # Whether a request scheduled this step can use the drafts proposed after
         # it. Stays set if that request is preempted later in the step.
         drafts_needed = not self.can_skip_drafts
+        # PATCH(spec-plain)
+        _sp_plain = False
+        if _SPEC_PLAIN_STEPS and self.num_spec_tokens:
+            if any(r.status == RequestStatus.WAITING for q in (self.waiting, getattr(self, "kv_holding_waiting", ())) for r in q):
+                self._sp_left = _SPEC_PLAIN_STEPS
+            _sp_left = getattr(self, "_sp_left", 0)
+            if _sp_left > 0:
+                _sp_plain = True
+                self._sp_left = _sp_left - 1
+        # PATCH(turn-first): a short input (caller turn / partial) is waiting -> no context-load chunks this step
+        _tf_turn = _TF_LONG > 0 and any(
+            r.status == RequestStatus.WAITING and 0 < r.num_tokens - r.num_computed_tokens <= _TF_LONG
+            for q in (self.waiting, getattr(self, "kv_holding_waiting", ()))
+            for r in q
+        )
+        # PATCH(pace)
+        _pace_on = False
+        if _PACE_TPS > 0 and self.running:
+            _pnow = time.monotonic()
+            _pace_on = any(
+                r.status == RequestStatus.WAITING and _pace_wants_reply(r)
+                for q in (self.waiting, getattr(self, "kv_holding_waiting", ()))
+                for r in q
+            )
+            for _r in self.running:
+                if not hasattr(_r, "_pace_base"):
+                    continue
+                _g = _r.num_tokens - _r._pace_base
+                if _g >= 1 and _r._pace_t1 is None:
+                    _r._pace_t1 = _pnow
+                if _g < _PACE_HEAD and _pace_wants_reply(_r):
+                    _pace_on = True
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
         # Whether a waiting request was admitted with prompt left to compute.
@@ -825,6 +857,11 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if (_tf_turn and request.is_prefill_chunk  # PATCH(turn-first)
+                    and request.num_tokens - request.num_computed_tokens > _TF_LONG):
+                req_index += 1
+                continue
+
             if (
                 self.ec_connector is not None
                 and request.mm_features
@@ -836,11 +873,19 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if _pace_on and getattr(request, "_pace_t1", None) is not None:  # PATCH(pace)
+                _g = request.num_tokens - request._pace_base
+                if _g >= _PACE_HEAD and _g > _PACE_HEAD + _PACE_TPS * (_pnow - request._pace_t1) + _PACE_LEAD:
+                    req_index += 1
+                    continue
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if _sp_plain and request.spec_token_ids:  # PATCH(spec-plain): drop drafts this step
+                num_new_tokens = max(1, num_new_tokens - len(request.spec_token_ids))
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
             num_new_tokens = min(
@@ -1098,6 +1143,11 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
+                    skip_request(request_queue)
+                    continue
+
+                # PATCH(turn-first): context loads wait while a caller turn is pending
+                if _tf_turn and request.num_tokens - request.num_computed_tokens > _TF_LONG:
                     skip_request(request_queue)
                     continue
 
@@ -1547,6 +1597,8 @@ class Scheduler(SchedulerInterface):
                 request = request_queue.pop_request()
                 self.deferred_waiting.discard(request)
                 self.running.append(request)
+                request._pace_base = request.num_tokens  # PATCH(pace): turn start
+                request._pace_t1 = None
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
                     has_sync_kv_loads = True
@@ -1563,9 +1615,18 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
-                req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
-                    request_id
-                )
+                # PATCH(stream-delta-resume): a resumed streaming session whose
+                # model-runner row is still resident ships only its new blocks.
+                if _SDR_ENABLED and _sdr_eligible(
+                    self, request, did_prefix_cache_lookup, num_external_computed_tokens
+                ):
+                    request._sdr_pending = True
+                    req_to_new_blocks[request_id] = new_blocks
+                else:
+                    request._sdr_pending = False
+                    req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
+                        request_id
+                    )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
@@ -1642,15 +1703,21 @@ class Scheduler(SchedulerInterface):
         if self.use_v2_model_runner:
             scheduled_new_reqs.extend(scheduled_resumed_reqs)
             scheduled_resumed_reqs.clear()
-            new_reqs_data = [
-                NewRequestData.from_request(
-                    req,
-                    req_to_new_blocks[req.request_id].get_block_ids(),
-                    req._all_token_ids,
-                    uses_mrope=self.model_uses_mrope,
+            if _SDR_ENABLED:
+                # PATCH(stream-delta-resume)
+                new_reqs_data = _sdr_build_new_reqs_data(
+                    self, scheduled_new_reqs, req_to_new_blocks
                 )
-                for req in scheduled_new_reqs
-            ]
+            else:
+                new_reqs_data = [
+                    NewRequestData.from_request(
+                        req,
+                        req_to_new_blocks[req.request_id].get_block_ids(),
+                        req._all_token_ids,
+                        uses_mrope=self.model_uses_mrope,
+                    )
+                    for req in scheduled_new_reqs
+                ]
         else:
             new_reqs_data = [
                 NewRequestData.from_request(
@@ -1708,6 +1775,8 @@ class Scheduler(SchedulerInterface):
 
         # Dynamic speculative decoding: compute optimal K
         num_spec_tokens_to_schedule = self.num_spec_tokens
+        if _sp_plain and getattr(self, "_sp_left", 0) > 0:  # PATCH(spec-plain)
+            num_spec_tokens_to_schedule = 0
         if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
@@ -2738,6 +2807,18 @@ class Scheduler(SchedulerInterface):
         else:
             request.status = RequestStatus.WAITING_FOR_STREAMING_REQ
             self.num_waiting_for_streaming_input += 1
+            # PATCH(gemma4-ttft): a paused streaming session keeps its KV
+            # resident. Out-of-window sliding-window blocks are otherwise only
+            # freed on the next allocation, so each paused session would pin up
+            # to max_num_batched_tokens + window stale tokens per SWA group and
+            # new sessions could wait forever for blocks. Free them now.
+            self.kv_cache_manager.remove_skipped_blocks(
+                request_id=request.request_id,
+                processed_computed_tokens=max(
+                    0, request.num_computed_tokens - request.num_in_flight_tokens
+                ),
+                num_prompt_tokens=request.num_prompt_tokens,
+            )
 
         return False
 
@@ -3781,3 +3862,116 @@ class Scheduler(SchedulerInterface):
         self.failed_recving_kv_req_ids |= async_failed_req_ids
         # Return sync affected IDs to skip in update_from_output
         return sync_failed_req_ids
+
+
+# PATCH(stream-delta-resume) BEGIN -------------------------------------------
+# Module-level helpers used by Scheduler.schedule(). See
+# forks/sglang_strata_lessons/LESSONS.md (lesson 1).
+import os as _sdr_os
+
+_SDR_ENABLED = _sdr_os.environ.get("VLLM_STREAM_DELTA_RESUME", "0") == "1"
+_SDR_VERIFY = _sdr_os.environ.get("VLLM_STREAM_DELTA_RESUME_VERIFY", "0") == "1"
+_SDR_COUNTS = [0, 0]  # [delta sends, full sends]
+
+
+def _sdr_eligible(
+    sched, request, did_prefix_cache_lookup, num_external_computed_tokens
+) -> bool:
+    """A delta send is only valid if the MRV2 worker still holds this
+    request's row exactly as last sent: it was sent before (_sdr_base set),
+    it resumes with resident KV (no prefix lookup => num_computed_tokens > 0,
+    i.e. not preempted, since preemption zeroes num_computed_tokens), and no
+    feature that re-derives per-request worker state from the full history is
+    active."""
+    base = getattr(request, "_sdr_base", None)
+    return (
+        base is not None
+        and sched.use_v2_model_runner
+        and not did_prefix_cache_lookup
+        and request.resumable
+        and request.num_computed_tokens >= base
+        and len(request._all_token_ids) >= base
+        and num_external_computed_tokens == 0
+        and sched.connector is None
+        and sched.ec_connector is None
+        and sched.aux_output_connector is None
+        and not sched.use_pp
+        and not sched.model_uses_mrope
+        and (not sched.num_spec_tokens or _SDR_ALLOW_SPEC)
+        and not sched.is_encoder_decoder
+        and not request.mm_features
+        and request.prompt_embeds is None
+        and request.pooling_params is None
+        and request.lora_request is None
+        and not getattr(request, "replay_start", 0)
+    )
+
+
+def _sdr_build_new_reqs_data(sched, scheduled_new_reqs, req_to_new_blocks):
+    new_reqs_data = []
+    for req in scheduled_new_reqs:
+        blocks = req_to_new_blocks[req.request_id]
+        all_ids = req._all_token_ids
+        if getattr(req, "_sdr_pending", False):
+            req._sdr_pending = False
+            base = req._sdr_base
+            data = NewRequestData.from_request(
+                req,
+                blocks.get_block_ids(),  # only this step's new blocks
+                all_ids[base:],  # copy of the short tail
+                uses_mrope=sched.model_uses_mrope,
+            )
+            data.stream_delta_start = base
+            if _SDR_VERIFY:
+                data.stream_delta_verify = (
+                    list(all_ids),
+                    sched.kv_cache_manager.get_block_ids(req.request_id),
+                )
+            _SDR_COUNTS[0] += 1
+            c = _SDR_COUNTS[0]
+            if c & (c - 1) == 0:  # 1, 2, 4, 8, ...
+                logger.info(
+                    "stream-delta-resume active: %d delta / %d full new-request "
+                    "sends so far (last: %s, %d of %d tokens shipped)",
+                    c,
+                    _SDR_COUNTS[1],
+                    req.request_id,
+                    len(all_ids) - base,
+                    len(all_ids),
+                )
+        else:
+            data = NewRequestData.from_request(
+                req,
+                blocks.get_block_ids(),
+                all_ids,
+                uses_mrope=sched.model_uses_mrope,
+            )
+            _SDR_COUNTS[1] += 1
+        # Length of the row the worker holds once this step is applied.
+        req._sdr_base = len(all_ids)
+        new_reqs_data.append(data)
+    return new_reqs_data
+
+
+# PATCH(stream-delta-resume) END ---------------------------------------------
+
+
+# PATCH(spec-plain)
+_SPEC_PLAIN_STEPS = int(_sdr_os.environ.get("VLLM_SPEC_PLAIN_STEPS", "0"))
+_SDR_ALLOW_SPEC = _sdr_os.environ.get("VLLM_SDR_ALLOW_SPEC", "0") == "1"
+
+
+# PATCH(pace)
+_PACE_TPS = float(_sdr_os.environ.get("VLLM_PACE_TPS", "0"))
+_PACE_HEAD = int(_sdr_os.environ.get("VLLM_PACE_HEAD", "25"))
+_PACE_LEAD = float(_sdr_os.environ.get("VLLM_PACE_LEAD", "10"))
+
+
+def _pace_wants_reply(r):
+    # STT partial chunks (max_tokens=1, output discarded) are not latency-critical
+    sp = getattr(r, "sampling_params", None)
+    return sp is None or (sp.max_tokens or 2) > 1
+
+
+# PATCH(turn-first)
+_TF_LONG = int(__import__("os").environ.get("VLLM_TURN_FIRST_LONG", "0"))

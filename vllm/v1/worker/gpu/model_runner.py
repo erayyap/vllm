@@ -1213,25 +1213,55 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.postprocess_sampled(**outputs)
 
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+        if getattr(self, "_sdr_pending_verify", None):
+            _sdr_run_verify(self)  # PATCH(stream-delta-resume) verify mode
         for new_req_data in scheduler_output.scheduled_new_reqs:
             assert new_req_data.prefill_token_ids is not None
             req_id = new_req_data.req_id
 
-            # Streaming input update: request already exists from a prior
-            # chunk. Remove old state so it can be cleanly re-added below
-            # with the updated prompt_token_ids and mm_features.
-            self._remove_request(req_id)
-
+            # PATCH(stream-delta-resume): None => stock full re-add.
+            sdr_start = getattr(new_req_data, "stream_delta_start", None)
             prompt_len = new_req_data.prompt_len
             sampling_params = new_req_data.sampling_params
-            self.req_states.add_request(
-                req_id=req_id,
-                prompt_len=prompt_len,
-                all_token_ids=new_req_data.prefill_token_ids,
-                num_computed_tokens=new_req_data.num_computed_tokens,
-                max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
-            )
+            if sdr_start is not None:
+                # Resident streaming session: keep the slot and its token row
+                # and block-table row; write only tokens [sdr_start:] and
+                # append only the new blocks. Mirrors _remove_request for the
+                # per-request side states that are re-added below.
+                self.model_state.remove_request(req_id)
+                if self.encoder_cache is not None:
+                    self.encoder_cache.remove_request(req_id)
+                if self.prompt_logprobs_worker is not None:
+                    self.prompt_logprobs_worker.remove_request(req_id)
+                self.lora_state.remove_request(req_id)
+                self.req_states.update_request_delta(
+                    req_id=req_id,
+                    prompt_len=prompt_len,
+                    delta_start=sdr_start,
+                    delta_token_ids=new_req_data.prefill_token_ids,
+                    num_computed_tokens=new_req_data.num_computed_tokens,
+                    max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                )
+            else:
+                # Streaming input update: request already exists from a prior
+                # chunk. Remove old state so it can be cleanly re-added below
+                # with the updated prompt_token_ids and mm_features.
+                self._remove_request(req_id)
+
+                self.req_states.add_request(
+                    req_id=req_id,
+                    prompt_len=prompt_len,
+                    all_token_ids=new_req_data.prefill_token_ids,
+                    num_computed_tokens=new_req_data.num_computed_tokens,
+                    max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                )
             req_index = self.req_states.req_id_to_index[req_id]
+            if sdr_start is not None and new_req_data.stream_delta_verify:
+                if not hasattr(self, "_sdr_pending_verify"):
+                    self._sdr_pending_verify = []
+                self._sdr_pending_verify.append(
+                    (req_id, req_index, new_req_data.stream_delta_verify)
+                )
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
 
@@ -1249,7 +1279,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             self.model_state.add_request(req_index, new_req_data)
             self.block_tables.append_block_ids(
-                req_index, new_req_data.block_ids, overwrite=True
+                req_index,
+                new_req_data.block_ids,
+                overwrite=sdr_start is None,  # PATCH(stream-delta-resume)
             )
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
 
@@ -2517,3 +2549,53 @@ def sort_batch_req_ids(
         num,
     )
     return sorted(num_tokens_per_req, key=key)
+
+
+# PATCH(stream-delta-resume) BEGIN -------------------------------------------
+_SDR_VERIFY_OK = [0]
+
+
+def _sdr_run_verify(runner) -> None:
+    """VLLM_STREAM_DELTA_RESUME_VERIFY=1: compare the resident row written by
+    the previous step's delta against the full history the scheduler holds.
+    Runs at the start of the next add_requests (staged writes and the block
+    table have been applied by then). Null (id 0) entries of the scheduler's
+    sliding-window groups are skipped: the worker keeps stale ids there,
+    which gather_block_tables masks to the null block at forward time."""
+    pending = runner._sdr_pending_verify
+    runner._sdr_pending_verify = []
+    torch.cuda.synchronize()
+    for req_id, req_index, (full_ids, full_block_ids) in pending:
+        if runner.req_states.req_id_to_index.get(req_id) != req_index:
+            continue  # finished/preempted since; nothing to check
+        n = len(full_ids)
+        got = runner.req_states.all_token_ids.gpu[req_index, :n].cpu().tolist()
+        if got != list(full_ids):
+            bad = next(i for i, (a, b) in enumerate(zip(got, full_ids)) if a != b)
+            raise RuntimeError(
+                f"stream-delta-resume VERIFY: token row mismatch for {req_id} "
+                f"at position {bad}/{n}: worker={got[bad]} sched={full_ids[bad]}"
+            )
+        for g, exp in enumerate(full_block_ids):
+            m = len(exp)
+            have = int(runner.block_tables.num_blocks.np[g, req_index])
+            if have < m:
+                raise RuntimeError(
+                    f"stream-delta-resume VERIFY: {req_id} group {g} has {have} "
+                    f"blocks on the worker, scheduler has {m}"
+                )
+            row = runner.block_tables.block_tables[g].gpu[req_index, :m].cpu()
+            row = row.tolist()
+            for i, (w, s) in enumerate(zip(row, exp)):
+                if s != 0 and w != s:
+                    raise RuntimeError(
+                        f"stream-delta-resume VERIFY: {req_id} group {g} block "
+                        f"{i}/{m}: worker={w} sched={s}"
+                    )
+        _SDR_VERIFY_OK[0] += 1
+        c = _SDR_VERIFY_OK[0]
+        if c & (c - 1) == 0:
+            logger.info("stream-delta-resume VERIFY ok (%d delta resumes checked)", c)
+
+
+# PATCH(stream-delta-resume) END ---------------------------------------------

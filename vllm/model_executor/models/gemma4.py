@@ -517,6 +517,17 @@ class Gemma4Attention(nn.Module):
             mm_prefix_clamp_sliding_window=self.is_sliding,
             prefix=f"{prefix}.attn",
         )
+        # PATCH(konly): k_eq_v global layer -> the cache holds only V; K = rope(k_norm.w * V)
+        self.konly = bool(
+            _KONLY
+            and not self.is_sliding
+            and not self.is_kv_shared_layer
+            and getattr(config, "attention_k_eq_v", False)
+        )
+        if self.konly:
+            self.attn.konly = _KONLY
+            self.attn._konly_ref = [self.k_norm, self.rotary_emb]  # list: not a submodule
+            self.attn.query_quant = None  # the attn512 kernel takes bf16 queries
 
     def forward(
         self,
@@ -542,15 +553,22 @@ class Gemma4Attention(nn.Module):
             q = self.q_norm(q)
             q = q.flatten(-2, -1)
 
-            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            k = self.k_norm(k)
-            k = k.flatten(-2, -1)
-            q, k = self.rotary_emb(positions, q, k)
+            if self.konly and _KONLY == 1:  # PATCH(konly): V only; K rebuilt in the kernel
+                v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                v = self.v_norm(v)
+                v = v.flatten(-2, -1)
+                q, _ = self.rotary_emb(positions, q, None)
+                attn_output = self.attn(q, v, v)
+            else:
+                k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                k = self.k_norm(k)
+                k = k.flatten(-2, -1)
+                q, k = self.rotary_emb(positions, q, k)
 
-            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            v = self.v_norm(v)
-            v = v.flatten(-2, -1)
-            attn_output = self.attn(q, k, v)
+                v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                v = self.v_norm(v)
+                v = v.flatten(-2, -1)
+                attn_output = self.attn(q, k, v)
 
         output, _ = self.o_proj(attn_output)
 
@@ -1504,3 +1522,9 @@ class Gemma4ForCausalLM(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+
+# PATCH(konly)
+import os as _konly_os
+
+_KONLY = int(_konly_os.environ.get("VLLM_KONLY", "0"))

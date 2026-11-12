@@ -673,10 +673,15 @@ class Attention(nn.Module, AttentionLayerBase):
             )
         else:
             return FullAttentionSpec(
-                block_size=block_size,
+                # PATCH(konly-bs): sidecar rows (2560 B/token) -> 192-token pages, padded 480->512 KB
+                block_size=(block_size * 3 if getattr(self, "konly", 0) == 2 else block_size),
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
-                head_size_v=self.head_size_v,
+                # PATCH(konly): K-only cache (V only, K rebuilt in the kernel)
+                # (mode 1: V only; mode 2: V + 128 RoPE'd K dims)
+                head_size_v=(
+                    {1: 0, 2: 128}[self.konly] if getattr(self, "konly", 0) else self.head_size_v
+                ),
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
             )

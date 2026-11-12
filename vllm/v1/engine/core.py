@@ -111,6 +111,13 @@ from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+import os as _os
+_COALESCE_GAP_S = float(_os.environ.get("VLLM_COALESCE_GAP_MS", "0")) / 1000.0
+_COALESCE_MAX_S = float(_os.environ.get("VLLM_COALESCE_MAX_MS", "50")) / 1000.0
+_TL = open(_os.environ["VLLM_TL"], "a", buffering=1) if _os.environ.get("VLLM_TL") else None
+if _os.environ.get("VLLM_SWITCH_INTERVAL_US"):
+    import sys as _sys
+    _sys.setswitchinterval(float(_os.environ["VLLM_SWITCH_INTERVAL_US"]) / 1e6)
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -731,12 +738,17 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        if _JITLA and len(batch_queue) == 1:  # PATCH(jit-lookahead)
+            _jitla_wait(self, batch_queue[0][0])
         if self.scheduler.has_requests():
+            _ta = time.time()
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            _tb = time.time()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
+            if _TL: _TL.write(f"tl_sched {_ta:.6f} sched={(_tb-_ta)*1e3:.2f} exec={(time.time()-_tb)*1e3:.2f} ntok={scheduler_output.total_num_scheduled_tokens} new={len(scheduler_output.scheduled_new_reqs)}\n")
             if not self.is_mm_encoder_only:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -761,6 +773,8 @@ class EngineCore:
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
+                if _JITLA:  # PATCH(jit-lookahead)
+                    _jitla_on_launch(future, time.time() - _ta)
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
                 ):
@@ -780,7 +794,11 @@ class EngineCore:
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
+            _tw = time.time()
             model_output = future.result()
+            if _JITLA:  # PATCH(jit-lookahead)
+                _jitla_on_done(future, time.time() - _tw)
+            if _TL: _TL.write(f"tl_wait {_tw:.6f} wait={(time.time()-_tw)*1e3:.2f}\n")
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -790,9 +808,11 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        _tu = time.time()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if _TL: _TL.write(f"tl_upd {_tu:.6f} upd={(time.time()-_tu)*1e3:.2f}\n")
         self._attach_iteration_details(engine_core_outputs, iteration_details)
         self._attach_weight_version(engine_core_outputs)
 
@@ -1647,6 +1667,7 @@ class EngineCoreProc(EngineCore):
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
         waited = False
+        idle_at_entry = not self.has_work()
         while not self.has_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
@@ -1675,12 +1696,30 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
+        # PATCH(gemma4-ttft): coalescing window. When the engine wakes from
+        # idle, keep admitting arrivals until a quiet gap so a burst of
+        # concurrent requests is scheduled into ONE step instead of a 1-request
+        # step followed by the rest.
+        if idle_at_entry and _COALESCE_GAP_S > 0 and self.has_work():
+            deadline = time.monotonic() + _COALESCE_MAX_S
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    req = self.input_queue.get(timeout=min(_COALESCE_GAP_S, remaining))
+                except queue.Empty:
+                    break
+                self._handle_client_request(*req)
+
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
         get_watch_dog().feed()
 
         # Step the engine core.
+        if _TL: _TL.write(f"step_start {time.time():.6f} running={len(self.scheduler.running)} waiting={len(self.scheduler.waiting)}\n")
         outputs, model_executed = self.step_fn()
+        if _TL: _TL.write(f"step_end {time.time():.6f} executed={model_executed} nout={sum(len(o.outputs) for o in outputs.values()) if outputs else 0}\n"); _TL.flush()
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)
@@ -1758,6 +1797,7 @@ class EngineCoreProc(EngineCore):
             req, request_wave = request
             if self._reject_add_in_shutdown(req) or self._reject_add_while_paused(req):
                 return
+            if _TL: _TL.write(f"add {time.time():.6f} {req.request_id[:8]} arrival={getattr(req, 'arrival_time', 0):.6f}\n")
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
@@ -2000,9 +2040,12 @@ class EngineCoreProc(EngineCore):
                     # Deserialize the request data.
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
+                        _t0 = time.time()
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        _t1 = time.time()
                         try:
                             request = self.preprocess_add_request(req)
+                            if _TL: _TL.write(f"inp {_t0:.6f} dec={(_t1-_t0)*1e3:.2f} pre={(time.time()-_t1)*1e3:.2f}\n")
                         except MultiModalCacheMissError as e:
                             # P0/P1 shadow drift -- return a retryable signal (P0
                             # drops the stale entry, client resends with data).
@@ -2858,3 +2901,65 @@ class EngineCoreActor(EngineCoreActorMixin, EngineCoreProc):
             log_stats,
             engine_index=dp_rank,
         )
+
+
+# PATCH(jit-lookahead) ------------------------------------------------------
+import collections as _jit_collections
+
+_JITLA = _os.environ.get("VLLM_JITLA", "0") == "1"
+_JITLA_LEAD_S = float(_os.environ.get("VLLM_JITLA_LEAD_MS", "2.0")) / 1000.0
+_JITLA_MAXWAIT_S = float(_os.environ.get("VLLM_JITLA_MAXWAIT_MS", "60")) / 1000.0
+
+
+class _JitState:
+    def __init__(self):
+        self.launch = {}  # id(future) -> monotonic launch time
+        self.prev_done = 0.0
+        self.durs = _jit_collections.deque(maxlen=8)
+        self.cpu_ema = 0.001
+        self.waits = 0
+        self.admitted = 0
+
+
+_JIT = _JitState()
+
+
+def _jitla_on_launch(fut, cpu_s):
+    _JIT.launch[id(fut)] = time.monotonic()
+    _JIT.cpu_ema = 0.8 * _JIT.cpu_ema + 0.2 * max(0.0, cpu_s)
+
+
+def _jitla_on_done(fut, waited_s):
+    now = time.monotonic()
+    t_launch = _JIT.launch.pop(id(fut), None)
+    if t_launch is not None and waited_s > 0.0003:
+        d = now - max(t_launch, _JIT.prev_done)
+        if 0.002 < d < 0.5:
+            _JIT.durs.append(d)
+    _JIT.prev_done = now
+
+
+def _jitla_wait(core, fut):
+    ao = getattr(fut, "async_output", None)
+    ev = getattr(ao, "copy_event", None)
+    t_launch = _JIT.launch.get(id(fut))
+    if ev is None or t_launch is None or len(_JIT.durs) < 3:
+        return
+    start = max(t_launch, _JIT.prev_done)
+    now = time.monotonic()
+    deadline = min(start + min(_JIT.durs) - _JITLA_LEAD_S - _JIT.cpu_ema, now + _JITLA_MAXWAIT_S)
+    if deadline <= now:
+        return
+    _JIT.waits += 1
+    while True:
+        now = time.monotonic()
+        if now >= deadline or ev.query():
+            break
+        try:
+            req = core.input_queue.get(timeout=min(0.0005, deadline - now))
+        except queue.Empty:
+            continue
+        core._handle_client_request(*req)
+        _JIT.admitted += 1
+    if _TL:
+        _TL.write(f"jit {time.time():.6f} waits={_JIT.waits} admitted={_JIT.admitted} T={min(_JIT.durs)*1e3:.1f} cpu={_JIT.cpu_ema*1e3:.2f}\n")

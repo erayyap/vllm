@@ -54,6 +54,14 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
     # DeepSeek-V4.1 only: SWA bounded replay; see Request.replay_start.
     replay_start: int = 0
+    # PATCH(stream-delta-resume): when not None this is a resumed streaming
+    # session whose model-runner row is still resident: prefill_token_ids
+    # holds only tokens [stream_delta_start:] and block_ids only the blocks
+    # allocated this step (appended to the row, not overwritten).
+    stream_delta_start: int | None = None
+    # PATCH(stream-delta-resume): VLLM_STREAM_DELTA_RESUME_VERIFY=1 only:
+    # (full token ids, full block ids) for an on-worker consistency check.
+    stream_delta_verify: tuple | None = None
 
     @classmethod
     def from_request(

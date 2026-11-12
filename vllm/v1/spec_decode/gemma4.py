@@ -354,6 +354,14 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
             target_idx = candidates[-1]
             target_layer_name = f"{target_prefix}.{target_idx}.self_attn.attn"
             attn.kv_sharing_target_layer_name = target_layer_name
+            # PATCH(konly): sharing a K-only target cache -> same K-only attention path
+            _tgt = self.vllm_config.compilation_config.static_forward_context.get(
+                target_layer_name
+            )
+            if getattr(_tgt, "konly", False):
+                attn.konly = _tgt.konly
+                attn._konly_ref = _tgt._konly_ref
+                attn.query_quant = None
             logger.info(
                 "Gemma4 MTP: draft layer %d (%s) -> %s",
                 draft_idx,

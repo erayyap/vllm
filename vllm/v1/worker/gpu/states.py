@@ -117,6 +117,50 @@ class RequestState:
         if self.num_speculative_steps > 0:
             self.draft_tokens[req_idx].zero_()
 
+    # PATCH(stream-delta-resume)
+    def update_request_delta(
+        self,
+        req_id: str,
+        prompt_len: int,
+        delta_start: int,
+        delta_token_ids: list[int],
+        num_computed_tokens: int,
+        max_tokens: int,
+    ) -> int:
+        """Resume a resident request in place: same slot, write only
+        all_token_ids[delta_start:]. delta_start must equal the prefill_len
+        this row was last given (positions past it hold sampled tokens that
+        the scheduler may have trimmed, so they are rewritten)."""
+        req_idx = self.req_id_to_index.get(req_id)
+        if req_idx is None:
+            raise RuntimeError(
+                f"stream-delta-resume: {req_id} has no resident row; "
+                "scheduler/worker state diverged. Disable "
+                "VLLM_STREAM_DELTA_RESUME and report this."
+            )
+        prev_prefill_len = int(self.prefill_len.np[req_idx])
+        if delta_start != prev_prefill_len:
+            raise RuntimeError(
+                f"stream-delta-resume: {req_id} delta_start={delta_start} != "
+                f"resident prefill_len={prev_prefill_len}"
+            )
+        prefill_len = delta_start + len(delta_token_ids)
+        assert prefill_len >= prompt_len, (
+            f"prefill_len {prefill_len} < prompt_len {prompt_len}"
+        )
+        self.max_seq_len[req_idx] = prompt_len + max_tokens
+        self.prompt_len.np[req_idx] = prompt_len
+        self.prefill_len.np[req_idx] = prefill_len
+        self.total_len.stage_write_elem(req_idx, prefill_len)
+        self.all_token_ids.stage_write(req_idx, delta_start, delta_token_ids)
+        self.num_computed_prefill_tokens[req_idx] = num_computed_tokens
+        self.num_computed_tokens_np[req_idx] = num_computed_tokens
+        self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
+
+        if self.num_speculative_steps > 0:
+            self.draft_tokens[req_idx].zero_()
+        return req_idx
+
     def apply_staged_writes(self) -> None:
         self.prompt_len.copy_to_uva()
         self.prefill_len.copy_to_uva()

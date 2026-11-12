@@ -192,8 +192,15 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
         # Look up DecodeStream on the module so backend patches (e.g. the
         # fastokens shim that replaces ``tokenizers.decoders.DecodeStream``)
         # are honored regardless of import order.
+        # PATCH(gemma4-ttft): prime with a short prompt suffix only. Priming with
+        # the full prompt makes the first step() decode the whole prompt
+        # (~25-30 ms for 30k tokens), serialized across requests in the
+        # frontend output loop. A 32-token tail gives identical output.
+        _prompt_ids = request.prompt_token_ids
+        if _prompt_ids is not None and len(_prompt_ids) > 32:
+            _prompt_ids = _prompt_ids[-32:]
         self.stream = tokenizers.decoders.DecodeStream(
-            ids=request.prompt_token_ids,
+            ids=_prompt_ids,
             skip_special_tokens=self.skip_special_tokens,
         )
 
