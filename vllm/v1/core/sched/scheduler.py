@@ -747,6 +747,21 @@ class Scheduler(SchedulerInterface):
             for q in (self.waiting, getattr(self, "kv_holding_waiting", ()))
             for r in q
         )
+        # PATCH(load-split): context-load chunks never share a step with live calls' work
+        _ls_load = False
+        if _LS and _TF_LONG > 0 and not _tf_turn:
+            _ls_loads = any(
+                r.is_prefill_chunk and r.num_tokens - r.num_computed_tokens > _TF_LONG for r in self.running
+            ) or any(
+                r.status == RequestStatus.WAITING and r.num_tokens - r.num_computed_tokens > _TF_LONG
+                for r in self.waiting
+            )
+            _ls_other = any(
+                not (r.is_prefill_chunk and r.num_tokens - r.num_computed_tokens > _TF_LONG) for r in self.running
+            )
+            _ls_load = _ls_loads and not (getattr(self, "_ls_prev", False) and _ls_other)
+        self._ls_prev = _ls_load
+        _ls_norm = _LS and _TF_LONG > 0 and not _ls_load  # normal step: no context-load chunks
         # PATCH(pace)
         _pace_on = False
         if _PACE_TPS > 0 and self.running:
@@ -857,8 +872,13 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            if (_tf_turn and request.is_prefill_chunk  # PATCH(turn-first)
+            if ((_tf_turn or _ls_norm) and request.is_prefill_chunk  # PATCH(turn-first) / PATCH(load-split)
                     and request.num_tokens - request.num_computed_tokens > _TF_LONG):
+                req_index += 1
+                continue
+
+            if _ls_load and not (request.is_prefill_chunk  # PATCH(load-split): load step, loads only
+                                 and request.num_tokens - request.num_computed_tokens > _TF_LONG):
                 req_index += 1
                 continue
 
@@ -1147,7 +1167,9 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 # PATCH(turn-first): context loads wait while a caller turn is pending
-                if _tf_turn and request.num_tokens - request.num_computed_tokens > _TF_LONG:
+                # PATCH(load-split): ... and on every normal step; load steps admit only context loads
+                _ls_long = request.num_tokens - request.num_computed_tokens > _TF_LONG
+                if ((_tf_turn or _ls_norm) and _ls_long) or (_ls_load and not _ls_long):
                     skip_request(request_queue)
                     continue
 
@@ -3975,3 +3997,7 @@ def _pace_wants_reply(r):
 
 # PATCH(turn-first)
 _TF_LONG = int(__import__("os").environ.get("VLLM_TURN_FIRST_LONG", "0"))
+
+
+# PATCH(load-split)
+_LS = __import__("os").environ.get("VLLM_LOAD_SPLIT", "0") == "1"
