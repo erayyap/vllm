@@ -1,0 +1,31 @@
+{
+  "gluon/fp8": {
+    "block_n": 128,
+    "dc": 64,
+    "num_warps": 8,
+    "num_stages": 3,
+    "ring": 4,
+    "lag": 2,
+    "qk_fp8": false,
+    "max_splits": 64,
+    "split_overhead_tiles": 12.0,
+    "min_tiles_per_split": 4
+  },
+  "auto": {
+    "fp8": "gluon"
+  },
+  "_meta": {
+    "gluon/fp8": {
+      "sum_ms": 6.9008,
+      "q": [
+        16,
+        32
+      ],
+      "kv_len": 30080,
+      "B": 20,
+      "page": 64
+    },
+    "date": "2026-11-12 00:28:21",
+    "device": "NVIDIA H100 80GB HBM3"
+  }
+}

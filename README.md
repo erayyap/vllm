@@ -1,3 +1,75 @@
+# Fork: vLLM 0.33.0 + Gemma 4 voice-session patches
+
+Branch `gemma4-voice` = tag v0.33.0 + patches to run Gemma 4 31B as 20 resident voice-call sessions (up to 64k
+context each, FP8 KV) on one H100 80GB. All patches are Python/Triton/Gluon only; no CUDA extension changes.
+The full write-up and every measurement are in [`gemma4_voice/README.md`](gemma4_voice/README.md).
+
+| commit | what | tested |
+|---|---|---|
+| Gemma 4 voice sessions: engine patches | pause-SWA bug fix, stream-delta-resume, K-only global KV + attn512 kernel hooks, JIT lookahead, coalescing, pace, turn-first | yes, H100 |
+| Scheduler: load-split (`VLLM_LOAD_SPLIT=1`) | context-load chunks never share a step with live calls' work | **no**: written after the GPU was returned |
+| attn512 kernel in the package + voice server | `vllm/attn512/` (kernel, tuned config, tests), `gemma4_voice/` (server, load generator, README) | kernel yes; packaging no |
+
+Measured with the measured setup (`VLLM_LOAD_SPLIT=0`): TTFT < 100 ms holds for resident sessions in steady
+state at ~28k context (p50 63–67 ms, p95 83–99 ms through the WebSocket server). It is missed while calls join
+(p95 110–128 ms at 28k, 210 ms at ~59k) and at ~59k steady state (p95 105 ms). Load-split is the candidate fix
+for the join case.
+
+## Install
+
+Either install this fork with vLLM 0.33.0's prebuilt binaries:
+
+```bash
+git clone -b gemma4-voice <this repo> vllm-gemma4-voice && cd vllm-gemma4-voice
+pip download vllm==0.33.0 --no-deps --only-binary=:all: -d /tmp/vllm-whl
+VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_LOCATION="$(ls /tmp/vllm-whl/vllm-0.33.0-*.whl)" pip install -e .
+pip install xxhash pyarrow fastapi uvicorn websockets
+```
+
+or patch a stock install. This is how the measurement box was set up:
+
+```bash
+pip install vllm==0.33.0 xxhash pyarrow fastapi uvicorn websockets
+git diff 4ba787e HEAD -- vllm/ ':!vllm/attn512/__init__.py' > gemma4_voice_vllm0.33.0.patch   # or use the shipped one
+cd "$(python3 -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))')" \
+  && patch -p1 < /path/to/gemma4_voice_vllm0.33.0.patch
+```
+
+## Run the fastest configuration
+
+`gemma4_voice/server.py` sets every engine knob to the fastest measured value (env defaults, each overridable):
+K-only global KV with the attn512 Gluon decode kernel (`VLLM_KONLY=2`), MTP with 3 draft tokens, FP8 KV, JIT
+lookahead, coalescing, pace, turn-first, context-load chunk cap 256, and now load-split.
+
+```bash
+cd gemma4_voice
+# capacity first: Google QAT int4 weights, 20 x 63k fit, fastest (p95 62-78 ms engine-level)
+python3 server.py --model /models/gemma-4-31B-it-qat-w4a16-ct \
+                  --spec-model /models/gemma-4-31B-it-qat-q4_0-unquantized-assistant --warmup
+# fidelity first: FP8-block weights (KL to BF16 0.015 vs 0.09 for QAT), 16 x 60k fit
+python3 server.py --model /models/gemma-4-31B-it-FP8-block --spec-model /models/gemma-4-31B-it-assistant --warmup
+# reproduce the measured numbers (load-split off)
+VLLM_LOAD_SPLIT=0 python3 server.py ...
+```
+
+Make sure the fast kernel is the one running. The decode kernel exists only in the Gluon implementation, and
+the default `ATTN512_IMPL=auto` silently falls back to the slower Triton kernel if Gluon does not import or
+fails its self-test. Run the kernel tests once on the target GPU (`python3 vllm/attn512/test_konly.py`), then
+start the server with `ATTN512_IMPL=gluon`: that skips the self-test and fails loudly instead of falling back.
+
+Kernel knobs (attn512 decode kernel; microbenchmark only, B=20, 30k keys, q=4 as with MTP 3):
+
+| env | default | best in the sweep | kernel time |
+|---|---|---|---|
+| `ATTN512_DEC_RING` | 8 | 16 | 1.062 → 1.028 ms together with 8 splits |
+| `ATTN512_DEC_LAG` | 1 | 1 (q=4), 2 with `ATTN512_DEC_PAIR=1` (q=1) | q=1: 0.978 → 0.903 ms |
+| `ATTN512_DEC_OVH` | 4 | split heuristic overhead | under CUDA graphs vLLM sizes splits for `VLLM_KONLY_GRAPH_KV`=65536 keys |
+
+The global layers are ~9% of a decode step, so these give well under 1% end to end; they were not run through
+vLLM. `ATTN512_DEC_RING=16` is the only one worth trying.
+
+---
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>

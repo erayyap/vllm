@@ -1625,6 +1625,8 @@ package_data = {
         "libs/*.so*",
         "model_executor/layers/fused_moe/configs/*.json",
         "model_executor/layers/quantization/utils/configs/*.json",
+        # attn512 K-only decode kernel: measured tuned config (Gemma 4 voice fork)
+        "attn512/*.json",
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",

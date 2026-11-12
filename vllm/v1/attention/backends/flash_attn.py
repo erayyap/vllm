@@ -2049,9 +2049,11 @@ def _konly_kernel():
         if name in sys.modules:
             _KONLY_MOD = sys.modules[name]
         else:
-            path = _konly_os.path.join(
-                _konly_os.environ.get("ATTN512_PATH", "/workspace/attn512"), "kernel.py"
-            )
+            # The kernel ships in vllm/attn512/; ATTN512_PATH points at another copy.
+            default = _konly_os.path.join(
+                _konly_os.path.dirname(_konly_os.path.dirname(_konly_os.path.dirname(
+                    _konly_os.path.dirname(_konly_os.path.abspath(__file__))))), "attn512")
+            path = _konly_os.path.join(_konly_os.environ.get("ATTN512_PATH", default), "kernel.py")
             spec = importlib.util.spec_from_file_location(name, path)
             mod = importlib.util.module_from_spec(spec)
             sys.modules[name] = mod
