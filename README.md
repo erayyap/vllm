@@ -43,14 +43,15 @@ lookahead, coalescing, pace, turn-first, context-load chunk cap 256, and now loa
 
 ```bash
 cd gemma4_voice
-# capacity first: Google QAT int4 weights, 20 x 63k fit, fastest (p95 62-78 ms engine-level)
-python3 server.py --model /models/gemma-4-31B-it-qat-w4a16-ct \
-                  --spec-model /models/gemma-4-31B-it-qat-q4_0-unquantized-assistant --warmup
-# fidelity first: FP8-block weights (KL to BF16 0.015 vs 0.09 for QAT), 16 x 60k fit
-python3 server.py --model /models/gemma-4-31B-it-FP8-block --spec-model /models/gemma-4-31B-it-assistant --warmup
+# default: FP8-block weights + MTP drafter (KL to BF16 0.015, top-1 97.2%); fits 20 x ~48k, the requirement is 20 x 30k
+ATTN512_IMPL=gluon python3 server.py --warmup
+# optional: Google QAT int4 weights, a bit faster (server p95 83 vs 93-99 ms) but lower fidelity (KL 0.09, top-1 92.4%)
+ATTN512_IMPL=gluon python3 server.py --model google/gemma-4-31B-it-qat-w4a16-ct \
+    --spec-model google/gemma-4-31B-it-qat-q4_0-unquantized-assistant --warmup
 # reproduce the measured numbers (load-split off)
-VLLM_LOAD_SPLIT=0 python3 server.py ...
+VLLM_LOAD_SPLIT=0 ATTN512_IMPL=gluon python3 server.py --warmup
 ```
+`--model` / `--spec-model` take HF ids or local dirs; `--spec-model none` turns speculative decoding off.
 
 Make sure the fast kernel is the one running. The decode kernel exists only in the Gluon implementation, and
 the default `ATTN512_IMPL=auto` silently falls back to the slower Triton kernel if Gluon does not import or

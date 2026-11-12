@@ -27,7 +27,7 @@ Server -> client:
 Partial text is appended verbatim; send the STT *increment* (new stable words), not the whole hypothesis.
 If the STT revises already-sent words, the simplest correct handling is to only forward words once stable.
 
-Run:  python3 server.py --model /workspace/models/fp8block --port 8100   (see README.md for env/patches)
+Run:  python3 server.py --warmup   (FP8-block preset with its MTP drafter; see README.md for the QAT preset)
 """
 import argparse, asyncio, json, os, sys, time, uuid
 
@@ -69,12 +69,15 @@ from vllm.sampling_params import RequestOutputKind
 from vllm.v1.metrics.loggers import StatLoggerBase
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--model", default="/workspace/models/fp8block")
+ap.add_argument("--model", default="RedHatAI/gemma-4-31B-it-FP8-block",
+                help="HF id or local dir. Default: FP8-block preset. QAT preset: google/gemma-4-31B-it-qat-w4a16-ct")
 ap.add_argument("--port", type=int, default=8100)
 ap.add_argument("--host", default="0.0.0.0")
 ap.add_argument("--max-sessions", type=int, default=24)
 ap.add_argument("--max-model-len", type=int, default=65536)
-ap.add_argument("--spec-model", default=None, help="e.g. /workspace/models/mtp (google/gemma-4-31B-it-assistant)")
+ap.add_argument("--spec-model", default="google/gemma-4-31B-it-assistant",
+                help="MTP drafter (HF id or local dir); 'none' disables. QAT preset: "
+                     "google/gemma-4-31B-it-qat-q4_0-unquantized-assistant")
 ap.add_argument("--spec-k", type=int, default=3)
 # Gemma 4 generation_config.json defaults
 ap.add_argument("--temperature", type=float, default=1.0)
@@ -94,10 +97,18 @@ ap.add_argument("--kv-turn-max", type=float, default=0.97,
 a = ap.parse_args()
 
 
-def _is_int4_ct(model_dir):
-    """True for compressed-tensors int4 (W4A16) checkpoints, which vLLM 0.33 serves with HummingLinearKernel."""
+def _is_int4_ct(model):
+    """True for compressed-tensors int4 (W4A16) checkpoints, which vLLM 0.33 serves with HummingLinearKernel.
+    `model` is a local dir or an HF id (config.json then comes from the HF cache / hub)."""
+    path = os.path.join(model, "config.json")
+    if not os.path.isfile(path):
+        try:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(model, "config.json")
+        except Exception:
+            return False
     try:
-        with open(os.path.join(model_dir, "config.json")) as f:
+        with open(path) as f:
             q = json.load(f).get("quantization_config") or {}
         return q.get("quant_method") == "compressed-tensors" and '"num_bits": 4' in json.dumps(q)
     except OSError:
@@ -122,7 +133,7 @@ engine_kw = dict(
 )
 if a.long_prefill_cap > 0:
     engine_kw["long_prefill_token_threshold"] = a.long_prefill_cap
-if a.spec_model:
+if a.spec_model and a.spec_model.lower() != "none":
     engine_kw["speculative_config"] = {"method": "mtp", "model": a.spec_model, "num_speculative_tokens": a.spec_k}
 
 app = FastAPI()

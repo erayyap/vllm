@@ -30,10 +30,11 @@ The two presets differ in weights:
 
 | preset | weights | MTP drafter | fits | voice TTFT p50 / p95 (stagger, partial) | decode tok/s per call |
 |---|---|---|---|---|---|
-| **fp8** (fidelity first) | `RedHatAI/gemma-4-31B-it-FP8-block` | `google/gemma-4-31B-it-assistant` | 16 × 60k (20 × ~48k) | 52 / 71, 51 / 76 ms | 99–107 |
+| **fp8** (default; fidelity first) | `RedHatAI/gemma-4-31B-it-FP8-block` | `google/gemma-4-31B-it-assistant` | 16 × 60k (20 × ~48k) | 52 / 71, 51 / 76 ms | 99–107 |
 | **qat** (capacity first) | `google/gemma-4-31B-it-qat-w4a16-ct` | `google/gemma-4-31B-it-qat-q4_0-unquantized-assistant` | **20 × 63k** | 49 / 78, **44 / 62** ms | 112 |
 
-"fits" is the engine's KV capacity. By default `server.py` admits new calls only up to 90% estimated usage
+"fits" is the engine's KV capacity. The requirement is 20 × 30k resident (64k is the per-call maximum), which both
+presets meet, so `server.py` defaults to the fp8 preset. By default `server.py` admits new calls only up to 90% estimated usage
 (`--kv-admit`), keeping the rest as headroom for live calls to grow.
 
 The QAT checkpoint is Google's quantization-aware-trained int4 release. Its next-token distribution is
@@ -78,11 +79,11 @@ sizes 1..1280, MTP with 3 speculative tokens.
 
 ```bash
 # install: see "Install" in the fork's top-level README.md; then, from gemma4_voice/:
-# fidelity-first preset
-python3 server.py --model /models/gemma-4-31B-it-FP8-block --spec-model /models/gemma-4-31B-it-assistant --warmup
-# capacity-first preset (20 x 64k)
-python3 server.py --model /models/gemma-4-31B-it-qat-w4a16-ct \
-                  --spec-model /models/gemma-4-31B-it-qat-q4_0-unquantized-assistant --warmup
+# default: fp8 preset (RedHatAI/gemma-4-31B-it-FP8-block + google/gemma-4-31B-it-assistant, MTP 3)
+python3 server.py --warmup
+# qat preset: a bit faster (server p95 83 vs 93-99 ms), lower fidelity (KL 0.09 vs 0.015 to BF16)
+python3 server.py --model google/gemma-4-31B-it-qat-w4a16-ct \
+                  --spec-model google/gemma-4-31B-it-qat-q4_0-unquantized-assistant --warmup
 python3 client_bench.py --calls 20 --turns 3                                   # steady state
 python3 client_bench.py --calls 20 --turns 34 --joiners 6 --joiner-gap 15 --seed 1   # + call churn
 python3 client_bench.py --calls 20 --turns 4 --context-chars 230000 --seed 2         # 20 x ~60k contexts
